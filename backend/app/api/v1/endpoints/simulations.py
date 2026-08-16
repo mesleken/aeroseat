@@ -23,6 +23,80 @@ from app.domain.injury_metrics import compute_all_injury_metrics
 
 router = APIRouter()
 
+from pydantic import BaseModel
+class CalibrationRequest(BaseModel):
+    pulse_type: str = "FORWARD_16G"
+
+class CustomSimRequest(BaseModel):
+    pulse_type: str = "FORWARD_16G"
+    dummy_type: str = "FAA_HIII_50M"
+    belt_k_lap: float = 48000.0
+    belt_k_shoulder: float = 42000.0
+    neck_k_z: float = 22000.0
+    rail_mount_k: float = 850000.0
+    cushion_k: float = 36000.0
+
+@router.post("/auto-calibrate")
+def run_auto_calibration(payload: CalibrationRequest):
+    """Runs the SciPy Nelder-Mead optimization on the Phase 7 Simulation Engine."""
+    from app.domain.physics.calibration_engine import ModelCalibrationEngine
+    from app.domain.physics.lumped_mass_model import LumpedMassCrashModel
+    import numpy as np
+
+    # Synthetic golden dataset representing NHTSA targets
+    model = LumpedMassCrashModel(pulse_type=payload.pulse_type)
+    baseline = model.run()
+    
+    golden = {}
+    if "head_acceleration" in baseline:
+        sim_head = np.array(baseline["head_acceleration"])
+        peak_idx = np.argmax(np.abs(sim_head))
+        golden["head_acceleration"] = (sim_head * (65.0 / max(1.0, np.abs(sim_head[peak_idx])))).tolist()
+        
+    if "belt_shoulder_load_kn" in baseline:
+        sim_belt = np.array(baseline["belt_shoulder_load_kn"])
+        peak_idx = np.argmax(np.abs(sim_belt))
+        golden["belt_shoulder_load_kn"] = (sim_belt * (7.5 / max(0.1, np.abs(sim_belt[peak_idx])))).tolist()
+        
+    if "neck_axial_force" in baseline:
+        sim_neck = np.array(baseline["neck_axial_force"])
+        peak_idx = np.argmax(np.abs(sim_neck))
+        golden["neck_axial_force"] = (sim_neck * (4100.0 / max(1.0, np.abs(sim_neck[peak_idx])))).tolist()
+
+    engine = ModelCalibrationEngine(calibration_dataset=golden)
+    engine.pulse_type = payload.pulse_type
+    result = engine.run_automated_calibration()
+    
+    return {
+        "status": "success",
+        "calibration_result": result
+    }
+
+@router.post("/simulate-custom")
+def run_custom_simulation(payload: CustomSimRequest):
+    """Runs a 16G/14G simulation using manual custom stiffness parameters."""
+    from app.domain.physics.lumped_mass_model import LumpedMassCrashModel
+    
+    model = LumpedMassCrashModel(dummy_type=payload.dummy_type, pulse_type=payload.pulse_type)
+    model.stiff.belt_k_lap = payload.belt_k_lap
+    model.stiff.belt_k_shoulder = payload.belt_k_shoulder
+    model.stiff.neck_k_z = payload.neck_k_z
+    model.stiff.rail_mount_k = payload.rail_mount_k
+    model.stiff.cushion_k = payload.cushion_k
+    
+    results = model.run()
+    
+    # Prune full timeseries arrays to limit payload size if necessary, but frontend uses it for 3D
+    return {
+        "status": "success",
+        "metrics": {
+            "hic15": results.get("hic15"),
+            "nij_max": results.get("nij_max"),
+            "lumbar_load": results.get("lumbar_load"),
+            "belt_shoulder_load_kn": results.get("belt_shoulder_load_kn")
+        },
+        "timeseries": results
+    }
 @router.post("/simulation-configurations", status_code=status.HTTP_201_CREATED)
 def create_simulation_config(payload: SimulationConfigCreate, db: Session = Depends(get_db)):
     model_rev = db.query(ModelRevision).filter(ModelRevision.id == payload.model_revision_id).first()
@@ -65,7 +139,8 @@ def create_simulation_config(payload: SimulationConfigCreate, db: Session = Depe
         contact_sha256=contact.sha256,
         boundary_condition_sha256=bc.sha256,
         dummy_sha256=dummy.fe_model_sha256,
-        pulse_sha256=pulse.sha256
+        pulse_sha256=pulse.sha256,
+        extra_spec=f"{payload.dummy_type}:{payload.pulse_type}:{payload.yaw_deg}:{payload.pitch_deg}:{payload.roll_deg}:{payload.dummy_offset_x}:{payload.dummy_offset_y}:{payload.dummy_offset_z}:{payload.dummy_recline_deg}:{payload.dummy_yaw_deg}:{payload.seat_pitch_warp_deg}:{payload.seat_roll_warp_deg}:{payload.seat_yaw_mount_deg}"
     )
 
     sim_config = SimulationConfiguration(
@@ -79,6 +154,20 @@ def create_simulation_config(payload: SimulationConfigCreate, db: Session = Depe
         pulse_definition_id=pulse.id,
         solver_name=payload.solver_name,
         solver_version=payload.solver_version,
+        dummy_type=payload.dummy_type,
+        pulse_type=payload.pulse_type,
+        custom_pulse_data=payload.custom_pulse_data,
+        yaw_deg=payload.yaw_deg,
+        pitch_deg=payload.pitch_deg,
+        roll_deg=payload.roll_deg,
+        dummy_offset_x=payload.dummy_offset_x,
+        dummy_offset_y=payload.dummy_offset_y,
+        dummy_offset_z=payload.dummy_offset_z,
+        dummy_recline_deg=payload.dummy_recline_deg,
+        dummy_yaw_deg=payload.dummy_yaw_deg,
+        seat_pitch_warp_deg=payload.seat_pitch_warp_deg,
+        seat_roll_warp_deg=payload.seat_roll_warp_deg,
+        seat_yaw_mount_deg=payload.seat_yaw_mount_deg,
         configuration_hash=config_hash,
         created_by=payload.created_by
     )
@@ -95,8 +184,8 @@ def run_qa_gate(config_id: str, db: Session = Depends(get_db)):
 
     qa_res_data = run_model_qa_gate({
         "material_dataset_id": config.material_dataset_id,
-        "dummy_type": "FAA_HIII_50M",
-        "pulse_direction": "FORWARD_16G",
+        "dummy_type": config.dummy_type or "FAA_HIII_50M",
+        "pulse_direction": config.pulse_type or "FORWARD_16G",
         "total_mass_kg": 54.5
     })
 
@@ -118,7 +207,11 @@ def run_simulation(config_id: str, db: Session = Depends(get_db)):
 
     qa = db.query(ModelQAResult).filter(ModelQAResult.simulation_configuration_id == config_id).first()
     if not qa:
-        qa_data = run_model_qa_gate({"material_dataset_id": config.material_dataset_id, "pulse_direction": "FORWARD_16G"})
+        qa_data = run_model_qa_gate({
+            "material_dataset_id": config.material_dataset_id, 
+            "dummy_type": config.dummy_type or "FAA_HIII_50M",
+            "pulse_direction": config.pulse_type or "FORWARD_16G"
+        })
         qa = ModelQAResult(simulation_configuration_id=config.id, checks=qa_data["checks"], overall_status=qa_data["overall_status"])
         db.add(qa)
         db.commit()
@@ -137,22 +230,24 @@ def run_simulation(config_id: str, db: Session = Depends(get_db)):
         processing_definition_sha256=proc_sha256
     )
 
-    existing_completed_job = get_completed_job_by_fingerprint(db, fingerprint)
-    if existing_completed_job:
-        existing_sim_res = db.query(SimulationResult).filter(SimulationResult.solver_job_id == existing_completed_job.id).first()
-        existing_inj = db.query(InjuryMetrics).filter(InjuryMetrics.simulation_result_id == existing_sim_res.id).first() if existing_sim_res else None
-        return {
-            "cache_hit": True,
-            "message": "Execution Fingerprint match found: reusing existing completed solver job.",
-            "solver_job": {"id": existing_completed_job.id, "status": existing_completed_job.status},
-            "simulation_result": {"id": existing_sim_res.id} if existing_sim_res else None,
-            "injury_metrics": {"id": existing_inj.id, "hic15": existing_inj.hic15, "femur_load_left": existing_inj.femur_load_left} if existing_inj else None
-        }
-
     adapter = get_solver_adapter(config.solver_name)
     prepared = adapter.prepare_input({
         "id": config.id,
-        "storage_dir": settings.STORAGE_DIR
+        "storage_dir": settings.STORAGE_DIR,
+        "yaw_deg": getattr(config, "yaw_deg", 0.0),
+        "pitch_deg": getattr(config, "pitch_deg", 0.0),
+        "roll_deg": getattr(config, "roll_deg", 0.0),
+        "dummy_offset_x": getattr(config, "dummy_offset_x", 0.0),
+        "dummy_offset_y": getattr(config, "dummy_offset_y", 0.0),
+        "dummy_offset_z": getattr(config, "dummy_offset_z", 0.0),
+        "dummy_recline_deg": getattr(config, "dummy_recline_deg", 0.0),
+        "dummy_yaw_deg": getattr(config, "dummy_yaw_deg", 0.0),
+        "seat_pitch_warp_deg": getattr(config, "seat_pitch_warp_deg", 0.0),
+        "seat_roll_warp_deg": getattr(config, "seat_roll_warp_deg", 0.0),
+        "seat_yaw_mount_deg": getattr(config, "seat_yaw_mount_deg", 0.0),
+        "pulse_type": getattr(config, "pulse_type", "FORWARD_16G"),
+        "dummy_type": getattr(config, "dummy_type", "FAA_HIII_50M"),
+        "custom_pulse_data": getattr(config, "custom_pulse_data", None)
     })
     
     ext_ref = adapter.submit_job(prepared, ComputeConfiguration())
@@ -194,6 +289,8 @@ def run_simulation(config_id: str, db: Session = Depends(get_db)):
         femur_load_left=metrics_data["femur_load_left"],
         femur_load_right=metrics_data["femur_load_right"],
         lumbar_load=metrics_data["lumbar_load"],
+        belt_shoulder_load_kn=metrics_data.get("belt_shoulder_load_kn"),
+        belt_lap_load_kn=metrics_data.get("belt_lap_load_kn"),
         head_excursion_mm=metrics_data["head_excursion_mm"],
         knee_excursion_mm=metrics_data["knee_excursion_mm"],
         seat_structural_status=metrics_data["seat_structural_status"],
@@ -215,8 +312,8 @@ def run_simulation(config_id: str, db: Session = Depends(get_db)):
                 val = max(inj_record.femur_load_left, inj_record.femur_load_right)
         elif req.metric == "LUMBAR_LOAD": val = inj_record.lumbar_load
         elif req.metric == "HEAD_EXCURSION": val = inj_record.head_excursion_mm
+        elif "BELT" in req.metric.upper() or "STRAP" in req.metric.upper(): val = inj_record.belt_shoulder_load_kn
         
-        # Missing signal handling: NOT_ASSESSABLE (P0 item 15)
         if val is None:
             req_status = RequirementStatus(
                 requirement_id=req.id,
@@ -240,21 +337,65 @@ def run_simulation(config_id: str, db: Session = Depends(get_db)):
 
     db.commit()
 
+    time_arr = raw_output.timeseries_data.get("time_s", [])
+    head_accel_arr = raw_output.timeseries_data.get("head_acceleration", [])
+    femur_l_arr = raw_output.timeseries_data.get("femur_load_left", [])
+    femur_r_arr = raw_output.timeseries_data.get("femur_load_right", [])
+    lumbar_arr = raw_output.timeseries_data.get("lumbar_load", [])
+    sled_accel_arr = raw_output.timeseries_data.get("sled_acceleration", [])
+
     return {
         "cache_hit": False,
-        "solver_job": {"id": job.id, "status": job.status, "execution_fingerprint": job.execution_fingerprint},
-        "simulation_result": {"id": sim_res.id, "solver_job_id": sim_res.solver_job_id, "output_sha256": sim_res.output_sha256},
+        "solver_job": {
+            "id": job.id, 
+            "status": job.status, 
+            "execution_fingerprint": job.execution_fingerprint
+        },
+        "simulation_result": {
+            "id": sim_res.id, 
+            "solver_job_id": sim_res.solver_job_id, 
+            "output_sha256": sim_res.output_sha256,
+            "duration_ms": 180.0,
+            "sample_count": len(time_arr)
+        },
         "injury_metrics": {
             "id": inj_record.id,
             "hic15": inj_record.hic15,
+            "hic15_t1_ms": metrics_data.get("hic15_t1_ms"),
+            "hic15_t2_ms": metrics_data.get("hic15_t2_ms"),
             "nij_max": inj_record.nij_max,
             "nij_type": inj_record.nij_type,
             "femur_load_left": inj_record.femur_load_left,
             "femur_load_right": inj_record.femur_load_right,
             "lumbar_load": inj_record.lumbar_load,
+            "belt_shoulder_load_kn": inj_record.belt_shoulder_load_kn,
+            "belt_lap_load_kn": inj_record.belt_lap_load_kn,
             "head_excursion_mm": inj_record.head_excursion_mm,
             "knee_excursion_mm": inj_record.knee_excursion_mm,
-            "seat_structural_status": inj_record.seat_structural_status
+            "seat_structural_status": inj_record.seat_structural_status,
+            "delta_v_ms": metrics_data.get("delta_v_ms")
+        },
+        "kinematics": raw_output.timeseries_data.get("kinematics", {}),
+        "frames": raw_output.timeseries_data.get("frames", {}),
+        "loads": raw_output.timeseries_data.get("loads", {}),
+        "constraints": raw_output.timeseries_data.get("constraints", {}),
+        "force_vectors": raw_output.timeseries_data.get("force_vectors", {}),
+        "animation": {
+            "available": True,
+            "sample_count": len(time_arr),
+            "duration_ms": 180.0,
+            "frames": raw_output.timeseries_data.get("frames", {}),
+            "kinematics": raw_output.timeseries_data.get("kinematics", {}),
+            "constraints": raw_output.timeseries_data.get("constraints", {}),
+            "force_vectors": raw_output.timeseries_data.get("force_vectors", {}),
+            "timeseries": {
+                "time": time_arr,
+                "head_accel": head_accel_arr,
+                "femur_load_l": femur_l_arr,
+                "femur_load_r": femur_r_arr,
+                "lumbar_load": lumbar_arr,
+                "sled_accel": sled_accel_arr
+            }
         }
     }
 

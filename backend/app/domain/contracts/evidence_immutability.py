@@ -22,9 +22,10 @@ def compute_configuration_hash(
     contact_sha256: str,
     boundary_condition_sha256: str,
     dummy_sha256: str,
-    pulse_sha256: str
+    pulse_sha256: str,
+    extra_spec: str = ""
 ) -> str:
-    """Configuration Hash = SHA256(ModelRevision + Mesh + Material + SolverMaterialRepresentation + Contact + BC + Dummy + Pulse)."""
+    """Configuration Hash = SHA256(ModelRevision + Mesh + Material + SolverMaterialRepresentation + Contact + BC + Dummy + Pulse + ExtraSpec)."""
     combined = (
         f"{model_revision_sha256}:"
         f"{mesh_sha256}:"
@@ -33,7 +34,8 @@ def compute_configuration_hash(
         f"{contact_sha256}:"
         f"{boundary_condition_sha256}:"
         f"{dummy_sha256}:"
-        f"{pulse_sha256}"
+        f"{pulse_sha256}:"
+        f"{extra_spec}"
     )
     return compute_sha256(combined)
 

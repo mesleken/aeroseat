@@ -90,15 +90,26 @@ def generate_evidence_artifact_endpoint(assessment_id: str, db: Session = Depend
 
     output_dir = os.path.join(settings.STORAGE_DIR, "artifacts", assessment.id)
 
+    solver_job = None
+    if config:
+        solver_job = db.query(SolverJob).filter(
+            SolverJob.simulation_configuration_id == config.id,
+            SolverJob.status == "COMPLETED"
+        ).order_by(SolverJob.started_at.desc()).first()
+
+    exec_fingerprint = solver_job.execution_fingerprint if (solver_job and solver_job.execution_fingerprint) else (config.configuration_hash if config else "N/A")
+
     input_manifest = {
         "simulation_configuration_id": config.id if config else "N/A",
         "configuration_hash": config.configuration_hash if config else "N/A",
+        "execution_fingerprint": exec_fingerprint,
         "cad_revision_label": model_rev.revision_label if model_rev else "RevA",
         "cad_file_sha256": model_rev.cad_file_sha256 if model_rev else "N/A",
-        "solver_name": config.solver_name if config else "LSDYNA",
-        "solver_version": config.solver_version if config else "R13.1",
-        "dummy_type": "FAA_HIII_50M",
-        "pulse_direction": "FORWARD_16G"
+        "solver_name": config.solver_name if config else "PHYSICS_LUMPED_MASS",
+        "solver_version": config.solver_version if config else "1.0.0",
+        "dummy_type": getattr(config, "dummy_type", "FAA_HIII_50M"),
+        "pulse_direction": getattr(config, "pulse_type", "FORWARD_16G"),
+        "is_reference_only": (config.solver_name != "LSDYNA") if config else True
     }
 
     output_manifest = {
@@ -114,7 +125,7 @@ def generate_evidence_artifact_endpoint(assessment_id: str, db: Session = Depend
     assessment_dict = {
         "overall_readiness": assessment.overall_readiness,
         "configuration_hash": config.configuration_hash if config else "N/A",
-        "execution_fingerprint": config.configuration_hash if config else "N/A",
+        "execution_fingerprint": exec_fingerprint,
         "requirement_compliance_summary": assessment.requirement_compliance_summary,
         "approved_by_name": "Lead Certification Engineer",
         "approval_role": assessment.approval_role,

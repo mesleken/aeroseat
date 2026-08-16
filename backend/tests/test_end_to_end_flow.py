@@ -28,8 +28,8 @@ def test_full_certification_pipeline_definition_of_done():
     # 4. Create Simulation Configuration
     sim_cfg_res = client.post("/api/v1/simulation-configurations", json={
         "model_revision_id": rev_id,
-        "solver_name": "LSDYNA",
-        "solver_version": "R13.1"
+        "solver_name": "PHYSICS_LUMPED_MASS",
+        "solver_version": "1.0.0"
     })
     assert sim_cfg_res.status_code == 201
     cfg_id = sim_cfg_res.json()["id"]
@@ -52,8 +52,8 @@ def test_full_certification_pipeline_definition_of_done():
     # 7. Register Physical Sled Test
     test_res = client.post("/api/v1/physical-tests", json={
         "seat_architecture_id": proj_id,
-        "test_facility": "OTEST Sled Facility",
-        "raw_data_uri": "s3://aeroseat/tests/otest_16g_test_042.csv"
+        "test_facility": "Accredited Dynamic Sled Facility",
+        "raw_data_uri": "s3://aeroseat/tests/dynamic_sled_16g_test_042.csv"
     })
     assert test_res.status_code == 201
     test_id = test_res.json()["id"]

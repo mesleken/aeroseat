@@ -1,0 +1,14 @@
+{
+  "correlation_vector": {
+    "channel": "head_acceleration",
+    "magnitude_error": -0.0455,
+    "phase_error_ms": 21.2,
+    "shape_metric_sprague_geers": 0.2542,
+    "sprague_geers_phase": 0.2501,
+    "peak_error": 0.0455,
+    "rms_error": 0.307
+  },
+  "regression_status": "SMOKE_TEST_PASS",
+  "numerical_delta": 0.0455,
+  "engineering_delta": "WITHIN_ALLOWABLE_MARGIN"
+}

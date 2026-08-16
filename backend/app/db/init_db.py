@@ -12,8 +12,44 @@ from app.db.database import engine, SessionLocal
 def compute_sha256(data: str) -> str:
     return hashlib.sha256(data.encode('utf-8')).hexdigest()
 
+from sqlalchemy import text
+
 def init_db(db: Session):
     Base.metadata.create_all(bind=engine)
+
+    # SQLite column auto-migration for newly added columns
+    with engine.connect() as conn:
+        for col, col_type in [
+            ("yaw_deg", "FLOAT DEFAULT 0.0"),
+            ("pitch_deg", "FLOAT DEFAULT 0.0"),
+            ("roll_deg", "FLOAT DEFAULT 0.0"),
+            ("dummy_offset_x", "FLOAT DEFAULT 0.0"),
+            ("dummy_offset_y", "FLOAT DEFAULT 0.0"),
+            ("dummy_offset_z", "FLOAT DEFAULT 0.0"),
+            ("dummy_recline_deg", "FLOAT DEFAULT 0.0"),
+            ("dummy_yaw_deg", "FLOAT DEFAULT 0.0"),
+            ("seat_pitch_warp_deg", "FLOAT DEFAULT 0.0"),
+            ("seat_roll_warp_deg", "FLOAT DEFAULT 0.0"),
+            ("seat_yaw_mount_deg", "FLOAT DEFAULT 0.0"),
+            ("dummy_type", "VARCHAR(100) DEFAULT 'FAA_HIII_50M'"),
+            ("pulse_type", "VARCHAR(50) DEFAULT 'FORWARD_16G'"),
+            ("custom_pulse_data", "JSON DEFAULT NULL"),
+        ]:
+            try:
+                conn.execute(text(f"ALTER TABLE simulation_configuration ADD COLUMN {col} {col_type}"))
+                conn.commit()
+            except Exception:
+                pass
+
+        for col, col_type in [
+            ("belt_shoulder_load_kn", "FLOAT DEFAULT NULL"),
+            ("belt_lap_load_kn", "FLOAT DEFAULT NULL"),
+        ]:
+            try:
+                conn.execute(text(f"ALTER TABLE injury_metrics ADD COLUMN {col} {col_type}"))
+                conn.commit()
+            except Exception:
+                pass
 
     # 1. Seed Default User & Customer
     admin_user = db.query(AppUser).filter(AppUser.email == "engineer@aeroseat.io").first()

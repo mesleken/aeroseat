@@ -65,14 +65,28 @@ class SimulationConfigCreate(BaseModel):
     boundary_condition_set_id: Optional[str] = None
     dummy_configuration_id: Optional[str] = None
     pulse_definition_id: Optional[str] = None
-    solver_name: str = "LSDYNA"
-    solver_version: str = "R13.1"
+    solver_name: str = "PHYSICS_LUMPED_MASS"
+    solver_version: str = "1.0.0"
+    dummy_type: str = "FAA_HIII_50M"
+    pulse_type: str = "FORWARD_16G"
+    custom_pulse_data: Optional[dict[str, Any]] = None
+    yaw_deg: float = 0.0
+    pitch_deg: float = 0.0
+    roll_deg: float = 0.0
+    dummy_offset_x: float = 0.0
+    dummy_offset_y: float = 0.0
+    dummy_offset_z: float = 0.0
+    dummy_recline_deg: float = 0.0
+    dummy_yaw_deg: float = 0.0
+    seat_pitch_warp_deg: float = 0.0
+    seat_roll_warp_deg: float = 0.0
+    seat_yaw_mount_deg: float = 0.0
     created_by: Optional[str] = "usr-default-admin-001"
 
 # Physical Test
 class PhysicalTestCreate(BaseModel):
     seat_architecture_id: str
-    test_facility: str = "OTEST"
+    test_facility: str = "Accredited Dynamic Sled Facility"
     test_date: Optional[date] = None
     raw_data_uri: str
     tema_video_uri: Optional[str] = None
