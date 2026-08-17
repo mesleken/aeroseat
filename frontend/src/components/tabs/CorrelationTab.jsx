@@ -40,7 +40,8 @@ export default function CorrelationTab({
       });
       const data = await res.json();
       setCustomSimResult(data.metrics);
-      alert("Simulation ran successfully! HIC15: " + data.metrics.hic15.toFixed(2));
+      const hicVal = data.metrics?.hic15 != null ? data.metrics.hic15.toFixed(2) : "N/A";
+      alert("Simulation ran successfully! HIC15: " + hicVal);
     } catch (e) {
       console.error(e);
       alert("Simulation failed.");

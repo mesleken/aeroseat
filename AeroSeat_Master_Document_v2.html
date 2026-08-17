@@ -1,0 +1,170 @@
+
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<title>AeroSeat Master Raporu v2</title>
+<style>
+    @page {
+        size: A4;
+        margin: 20mm 15mm;
+        background-color: #fcfdfd;
+    }
+    body {
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        color: #2c3e50;
+        font-size: 10pt;
+        line-height: 1.5;
+    }
+    h1 {
+        font-size: 22pt;
+        color: #1a5276;
+        text-align: center;
+        border-bottom: 3px solid #2980b9;
+        padding-bottom: 10px;
+        margin-bottom: 10px;
+    }
+    .subtitle {
+        text-align: center;
+        color: #7f8c8d;
+        font-size: 12pt;
+        margin-bottom: 30px;
+        font-style: italic;
+    }
+    h2 {
+        font-size: 14pt;
+        color: #2980b9;
+        border-left: 5px solid #e74c3c;
+        padding-left: 10px;
+        margin-top: 25px;
+        background-color: #f4f6f7;
+        padding-top: 5px;
+        padding-bottom: 5px;
+    }
+    h3 {
+        font-size: 12pt;
+        color: #34495e;
+        margin-top: 15px;
+    }
+    p { margin-bottom: 10px; }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 15px 0;
+        font-size: 9.5pt;
+    }
+    th, td {
+        border: 1px solid #bdc3c7;
+        padding: 8px;
+        text-align: left;
+    }
+    th {
+        background-color: #ecf0f1;
+        color: #2c3e50;
+    }
+    .highlight {
+        background-color: #e8f8f5;
+        border-left: 4px solid #1abc9c;
+        padding: 10px;
+        margin: 15px 0;
+    }
+    .danger {
+        background-color: #fdedec;
+        border-left: 4px solid #e74c3c;
+        padding: 10px;
+        margin: 15px 0;
+    }
+    pre {
+        background-color: #2b3e50;
+        color: #ecf0f1;
+        padding: 12px;
+        border-radius: 5px;
+        font-family: 'Courier New', Courier, monospace;
+        font-size: 8.5pt;
+        overflow-x: auto;
+        white-space: pre-wrap;
+    }
+</style>
+</head>
+<body>
+
+    <h1>AeroSeat: CAE ve Sertifikasyon Platformu</h1>
+    <div class="subtitle">Master Mimari, Doğrulama (Golden Case) ve Geliştirme Raporu V2</div>
+
+    <h2>1. Mimarinin Temeli: 3-Tier Çapraz Doğrulama</h2>
+    <p>AeroSeat, bağımsız bir sertifikasyon otoritesi çözücüsü olarak tasarlanmıştır. Sistemin fiziksel ve matematiksel bütünlüğü üç aşamalı bir yöntemle doğrulanır:</p>
+    <ul>
+        <li><strong>Level 1 (AeroSeat ↔ Chrono):</strong> Matematiksel modellerin (Rigid Body / Joint Dynamics) yapısal bütünlük testi.</li>
+        <li><strong>Level 2 (Chrono ↔ Experimental):</strong> Açık kaynaklı referans motorunun (Project Chrono) gerçek testlerle uyumu.</li>
+        <li><strong>Level 3 (AeroSeat ↔ Experimental):</strong> CS/FAR 25.562 standartlarında asıl sertifikasyon gereksinimi (HIC, Lumbar, Femur limit onayları).</li>
+    </ul>
+
+    <h2>2. Akademik "Ground Truth" (Golden Case) Veri Seti</h2>
+    <p>Lamanna et al. (2019) ve Caputo et al. (2018) tarafından Geven S.p.A. laboratuvarlarında gerçekleştirilen 16g sled test verileri, AeroSeat'in birincil benchmark kaynağıdır.</p>
+    
+    <div class="danger">
+        <strong>VAKA A: Baseline / FAIL Senaryosu (Orijinal Tasarım)</strong><br>
+        16g üçgen pulse, 583 mm setback, standart kemer. Kafa bulkhead'e çarpıyor.<br>
+        • Deneysel Maksimum İvme: <b>649.0 g</b><br>
+        • Deneysel HIC Değeri: <b>6176.4</b> (Kritik Zaman Aralığı: 0.1752 s - 0.1766 s)<br>
+        <i>* Kaynak: Caputo 2018, Figure 9.</i>
+    </div>
+
+    <div class="highlight">
+        <strong>VAKA B: Redesign / PASS Senaryosu (DoE Run 2)</strong><br>
+        Orijinal geometride yapılan modifikasyonlar ile HIC uyumu sağlanmış ve baş çarpışması engellenmiştir (Head clearance: 555 mm).<br>
+        • <b>Optimum Parametreler (mm):</b> Ap_x = 26, Ap_y = 44, d1 = 3.0, d2 = 3.0, d3 = 1.8, d4 = 2.0, d5 = 20.0, d6 = 1.5, d7 = 250.0.<br>
+        <i>* Kaynak: Lamanna 2019, Tablo 1 ve Figure 6.</i>
+    </div>
+
+    <h2>3. Çekirdek Modüller ve Kod Altyapısı</h2>
+
+    <h3>3.1. HIC Biyomekanik Çözücüsü (biomechanics.py)</h3>
+    <p>AeroSeat, ivme eğrisinin altındaki alanı (O(N²)) Sliding Window mantığıyla tarayarak en kritik t1-t2 aralığını (maks. 15ms veya 36ms) bulur.</p>
+<pre>
+def calculate_hic(self, time_s, accel_g, max_window_s=0.036):
+    max_hic, best_t1, best_t2 = 0.0, 0.0, 0.0
+    for i in range(len(time_s)):
+        for j in range(i + 1, len(time_s)):
+            dt = time_s[j] - time_s[i]
+            if dt > max_window_s: break
+            
+            integral = np.trapz(accel_g[i:j+1], time_s[i:j+1])
+            hic_val = dt * ((integral / dt) ** 2.5)
+            
+            if hic_val > max_hic:
+                max_hic, best_t1, best_t2 = hic_val, time_s[i], time_s[j]
+    return max_hic, best_t1, best_t2
+</pre>
+
+    <h3>3.2. Çapraz Doğrulama Regresyon Testleri (test_golden_reference.py)</h3>
+    <p>Geliştirilen her yeni versiyonun, elde edilen kesin Geven S.p.A. sonuçlarıyla uyumlu kaldığını teyit eden otomatik test mekanizması.</p>
+<pre>
+def test_baseline_head_impact_occurs(base_golden_setup):
+    seat = SeatModel(setback_mm=583, belt_type='standard')
+    results = SledTest(seat, dummy, pulse).run()
+    assert results.head_impact_occurred is True
+    assert results.hic > 6000  # Gerçek deney: 6176.4
+    assert 600 < results.max_head_accel_g < 700  # Gerçek deney: 649.0 g
+
+def test_redesigned_no_head_impact(base_golden_setup):
+    seat = SeatModel(setback_mm=583, belt_type='optimized')
+    seat.apply_design_factors(ap_x=26, ap_y=44, d1=3.0, d2=3.0, d3=1.8, d4=2.0, d5=20.0, d6=1.5, d7=250.0)
+    results = SledTest(seat, dummy, pulse).run()
+    assert results.head_impact_occurred is False
+    assert results.hic < 1000
+    assert results.head_path_mm <= 555
+</pre>
+
+    <h2>4. BEPU Analizi (Sensitivite Motoru)</h2>
+    <p>Lamanna et al. (2019) çalışmasındaki Plackett-Burman tasarım parametreleri (Table 1), AeroSeat'in Monte Carlo motoru (Phase 10) için temel endüstriyel belirsizlik (tolerans) sınırları olarak kullanılmaktadır.</p>
+<pre>
+mc_engine = MonteCarloEngine(samples=1000)
+mc_engine.add_parameter("belt_anchor_x_mm", UniformDistribution(26, 45))
+mc_engine.add_parameter("belt_anchor_y_mm", UniformDistribution(44, 88))
+mc_engine.add_parameter("rear_beam_thickness_mm", UniformDistribution(2.0, 3.0))
+# ... 9 faktörün tamamı tanımlanır.
+</pre>
+
+</body>
+</html>

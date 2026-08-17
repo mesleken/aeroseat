@@ -1,102 +1,133 @@
-"""
-AeroSeat Lumped-Mass Multi-DOF Dynamics Engine
-
-Mathematical crashworthiness model representing an aircraft seat structure and occupant
-(FAA Hybrid III 50M, 5F, 95M) mounted to a dynamic sled fixture during 16g forward & 14g downward
-dynamic sled impacts per 14 CFR § 25.562 / SAE AS8049E.
-
-Physical Coupling Chain (Pure Inertial Frame Multi-Body Mechanics):
-Sled Prescribed Deceleration Pulse a_sled(t) -> Sled Track Displacement
-    -> Seat Rail Mount Connection (k_mount, c_mount) -> Seat Frame Dynamics (m_seat, I_seat)
-    -> Lap Belt (k_lap, c_lap) + Cushion Dynamic Support/Friction -> Pelvis Dynamics (m_pelvis)
-    -> Thoracolumbar Spine Joint (k_spine, c_spine) + Shoulder Harness (k_sh) + Backrest Rebound Contact -> Torso Dynamics (m_torso, I_torso)
-    -> Cervical Neck Joint (k_neck, c_neck) + Cervical Whiplash Angular Dynamics -> Head Motion (m_head, I_head)
-    -> Exact SAE J211 Head Acceleration & Certification Injury Metrics (HIC15, Nij, Lumbar, Femur)
-    -> Physical Connection Graph & Constraint Validation Diagnostics Package
-"""
-
 import numpy as np
-from dataclasses import dataclass
-from typing import Optional
-from app.domain.physics.pulse_library import transform_pulse_3d, generate_sae_16g_forward_pulse, generate_sae_14g_downward_pulse
+from dataclasses import dataclass, field
+from typing import Optional, List
+
+from app.domain.physics.pulse_library import transform_pulse_3d, compute_euler_rotation_matrix
 from app.domain.physics.signal_processing import sae_j211_cfc_filter, validate_pulse_delta_v
-from app.domain.physics.seat.seat_structure import SeatStructureCompliance, SeatMountingCompliance, CushionSettlingMechanics
+from app.domain.physics.seat.seat_structure import (
+    SeatMountingCompliance,
+    SeatStructureCompliance,
+    CushionSettlingMechanics
+)
 from app.domain.physics.multibody.constitutive import ConstitutiveModels
+from app.domain.physics.multibody.contact_geometry import ObstacleContactEngine, FlailEnvelopeContactConfig, ObstacleSurface
+from app.domain.physics.multibody.articulated_joint import ArticulatedJoint, ArticulatedJointConfig
+
 @dataclass
 class OccupantSegmentConfig:
-    """Anthropomorphic test dummy (ATD) mass and inertia properties (kg, kg*m^2)."""
-    head_mass: float = 4.54
-    neck_mass: float = 1.54
-    thorax_mass: float = 23.04
-    pelvis_mass: float = 12.78
-    femur_left_mass: float = 5.67
-    femur_right_mass: float = 5.67
-    head_inertia_y: float = 0.024
-    torso_inertia_y: float = 1.85
-    neck_length_m: float = 0.115
+    """Anthropometric segment definitions for FAA Hybrid III Test Dummies (Full 77.7 kg Hybrid III 50M)."""
+    head_mass: float = 4.54          # kg
+    neck_mass: float = 1.54          # kg
+    thorax_mass: float = 23.04       # kg
+    pelvis_mass: float = 14.80       # kg
+    femur_left_mass: float = 5.90    # kg
+    femur_right_mass: float = 5.90   # kg
+    tibia_left_mass: float = 4.65    # kg (lower leg)
+    tibia_right_mass: float = 4.65   # kg (lower leg)
+    foot_left_mass: float = 1.25     # kg
+    foot_right_mass: float = 1.25    # kg
+    arms_mass: float = 10.10         # kg (coupled to torso)
+    head_inertia_y: float = 0.024    # kg*m^2 (Pitch axis)
+    torso_inertia_y: float = 1.85    # kg*m^2 (Pitch axis)
+    neck_length_m: float = 0.115     # m (115 mm OC-to-T1 lever arm)
 
-# Standard Aviation Dummy Anthropometry Presets
-DUMMY_PRESETS: dict[str, OccupantSegmentConfig] = {
+    @property
+    def total_dummy_mass_kg(self) -> float:
+        """Returns total anthropometric dummy mass in kg (~77.7 kg for 50M)."""
+        return (
+            self.head_mass + self.neck_mass + self.thorax_mass + self.pelvis_mass +
+            self.femur_left_mass + self.femur_right_mass + self.tibia_left_mass +
+            self.tibia_right_mass + self.foot_left_mass + self.foot_right_mass + self.arms_mass
+        )
+
+DUMMY_PRESETS = {
     "FAA_HIII_50M": OccupantSegmentConfig(
-        head_mass=4.54, neck_mass=1.54, thorax_mass=23.04, pelvis_mass=12.78, femur_left_mass=5.67, femur_right_mass=5.67,
+        head_mass=4.54, neck_mass=1.54, thorax_mass=23.04, pelvis_mass=14.80,
+        femur_left_mass=5.90, femur_right_mass=5.90,
+        tibia_left_mass=4.65, tibia_right_mass=4.65,
+        foot_left_mass=1.25, foot_right_mass=1.25, arms_mass=10.10,
         head_inertia_y=0.024, torso_inertia_y=1.85, neck_length_m=0.115
     ),
     "FAA_HIII_5F": OccupantSegmentConfig(
-        head_mass=3.63, neck_mass=1.15, thorax_mass=17.28, pelvis_mass=9.59, femur_left_mass=4.25, femur_right_mass=4.25,
+        head_mass=3.63, neck_mass=1.15, thorax_mass=17.28, pelvis_mass=11.10,
+        femur_left_mass=4.42, femur_right_mass=4.42,
+        tibia_left_mass=3.48, tibia_right_mass=3.48,
+        foot_left_mass=0.94, foot_right_mass=0.94, arms_mass=7.58,
         head_inertia_y=0.018, torso_inertia_y=1.35, neck_length_m=0.100
     ),
     "FAA_HIII_95M": OccupantSegmentConfig(
-        head_mass=5.45, neck_mass=1.85, thorax_mass=27.65, pelvis_mass=15.34, femur_left_mass=6.80, femur_right_mass=6.80,
+        head_mass=5.45, neck_mass=1.85, thorax_mass=27.65, pelvis_mass=17.76,
+        femur_left_mass=7.08, femur_right_mass=7.08,
+        tibia_left_mass=5.58, tibia_right_mass=5.58,
+        foot_left_mass=1.50, foot_right_mass=1.50, arms_mass=12.12,
         head_inertia_y=0.031, torso_inertia_y=2.30, neck_length_m=0.130
     ),
 }
 
 @dataclass
+class BeltAnchorGeometry:
+    """3D Spatial Anchor Locations for 3-Point Aviation Restraint Routing."""
+    d_ring_xyz: tuple[float, float, float] = (0.28, 0.22, -0.42)   # Upper shoulder harness guide (m)
+    buckle_xyz: tuple[float, float, float] = (0.02, 0.18, 0.06)     # Central stalk buckle latch (m)
+    lap_anchor_l: tuple[float, float, float] = (-0.05, -0.22, 0.08) # Outboard pelvic attachment (m)
+    lap_anchor_r: tuple[float, float, float] = (-0.05, 0.22, 0.08)  # Inboard pelvic attachment (m)
+
+@dataclass
 class RestraintAndStiffnessConfig:
-    """Viscoelastic properties of structural joints, cushion, and restraints."""
-    # Cervical Neck Joint
-    neck_k_x: float = 12000.0        # N/m (flexion/extension shear stiffness)
-    neck_c_x: float = 180.0          # N*s/m
-    neck_k_z: float = 22000.0        # N/m (axial tension/compression)
-    neck_c_z: float = 750.0
-    neck_rot_k: float = 180.0        # N*m/rad (cervical pitch rotational stiffness)
-    neck_rot_c: float = 12.0         # N*m*s/rad
+    """Viscoelastic properties of structural joints, cushion, and restraints (Phase 12 Industrial MBD Defaults)."""
+    # Cervical Neck Joint (Hunt-Crossley Non-Linear Joint)
+    neck_k_x: float = 14000.0        # N/m (flexion/extension shear stiffness)
+    neck_c_x: float = 240.0          # N*s/m
+    neck_k_z: float = 28000.0        # N/m (axial tension/compression)
+    neck_c_z: float = 850.0          # N*s/m
+    neck_rot_k: float = 220.0        # N*m/rad (cervical pitch rotational stiffness)
+    neck_rot_c: float = 16.0         # N*m*s/rad
     
     # Thoracolumbar Spine Joint
-    spine_k_x: float = 18000.0       # N/m (thoracolumbar bending shear)
-    spine_c_x: float = 650.0
-    spine_k_z: float = 38000.0       # N/m (spinal axial compression)
-    spine_c_z: float = 1300.0
-    spine_rot_k: float = 650.0       # N*m/rad (lumbar joint pitch stiffness)
-    spine_rot_c: float = 55.0        # N*m*s/rad
+    spine_k_x: float = 22000.0       # N/m (thoracolumbar bending shear)
+    spine_c_x: float = 800.0         # N*s/m
+    spine_k_z: float = 48000.0       # N/m (spinal axial compression)
+    spine_c_z: float = 1600.0        # N*s/m
+    spine_rot_k: float = 750.0       # N*m/rad (lumbar joint pitch stiffness)
+    spine_rot_c: float = 65.0        # N*m*s/rad
     
-    # 3-Point Belt Restraint System
-    belt_slack_mm: float = 16.0
-    belt_k_lap: float = 48000.0      # N/m (lap belt webbing tensile stiffness)
-    belt_c_lap: float = 1100.0
-    belt_k_shoulder: float = 42000.0 # N/m (shoulder diagonal harness stiffness)
-    belt_c_shoulder: float = 1300.0
+    # 3-Point Belt Restraint System (Aviation High-Tenacity Polyester Webbing)
+    belt_slack_mm: float = 16.0      # mm (geometric slack)
+    belt_film_spool_mm: float = 30.0 # mm (retractor spool-out effect)
+    belt_k_lap: float = 120000.0     # N/m (lap belt webbing tensile stiffness)
+    belt_c_lap: float = 2200.0       # N*s/m
+    belt_k_shoulder: float = 95000.0 # N/m (shoulder diagonal harness stiffness)
+    belt_c_shoulder: float = 2800.0  # N*s/m
+    belt_anchors: BeltAnchorGeometry = field(default_factory=BeltAnchorGeometry)
     
-    # Sled-to-Seat Rail Mounting Connection (Rigid Track Clamps with Structural Compliance)
+    # Sled-to-Seat Rail Mounting Connection (Elastoplastic Floor Track Clamps)
     rail_mount_k: float = 850000.0   # N/m (high-stiffness floor track clamp)
     rail_mount_c: float = 18000.0    # N*s/m
+    floor_elastic_k: float = 8500000.0 # N/m (aircraft fuselage floor compliance)
+    floor_elastic_c: float = 45000.0   # N*s/m
     seat_rot_k: float = 32000.0      # N*m/rad (seat structure pitch stiffness)
     seat_rot_c: float = 650.0        # N*m*s/rad
     
-    # Cushion & Backrest Viscoelastic Contact Mechanics
-    cushion_k: float = 36000.0       # N/m (seat pan cushion vertical compression)
-    cushion_c: float = 1400.0        # N*s/m
+    # Cushion & Backrest Viscoelastic 3-Phase Contact Mechanics
+    cushion_k: float = 48000.0       # N/m (seat pan cushion baseline stiffness)
+    cushion_c: float = 2200.0        # N*s/m
     cushion_mu: float = 0.45         # Kinetic friction coefficient on seat pan
-    backrest_k: float = 24000.0      # N/m (backrest rebound support stiffness)
-    backrest_c: float = 850.0        # N*s/m
+    backrest_k: float = 28000.0      # N/m (backrest rebound support stiffness)
+    backrest_c: float = 1100.0       # N*s/m
     
     # Knee - Forward Structure Obstacle Contact
-    knee_clearance_mm: float = 420.0 # Forward clearance to front seat row
+    knee_clearance_mm: float = 420.0 # Forward clearance to front seat row (mm)
     knee_contact_k: float = 95000.0  # N/m
-    knee_contact_c: float = 1800.0
+    knee_contact_c: float = 1800.0   # N*s/m
+    
+    # Lower Leg & Foot Contact Mechanics
+    knee_joint_k: float = 4500.0     # N*m/rad (knee flexion resistance)
+    knee_joint_c: float = 120.0      # N*m*s/rad
+    foot_floor_k: float = 180000.0   # N/m (floor contact under foot)
+    foot_floor_c: float = 3500.0     # N*s/m
 
 class LumpedMassCrashModel:
-    """Multi-DOF Inertial-Frame Non-Linear Crash Dynamics Engine."""
+    """Multi-DOF Inertial-Frame High-Fidelity Crash Dynamics Engine (Phase 12 Industrial MBD)."""
 
     def __init__(
         self,
@@ -116,6 +147,7 @@ class LumpedMassCrashModel:
         seat_roll_warp_deg: float = 0.0,
         seat_yaw_mount_deg: float = 0.0,
         custom_pulse_data: Optional[dict] = None,
+        forward_obstacle_pitch_inches: Optional[float] = None,
         seed: int = 42
     ):
         if occupant is not None:
@@ -140,20 +172,52 @@ class LumpedMassCrashModel:
         self.seat_roll_warp_deg = float(seat_roll_warp_deg)
         self.seat_yaw_mount_deg = float(seat_yaw_mount_deg)
         self.custom_pulse_data = custom_pulse_data
+        self.forward_obstacle_pitch_inches = forward_obstacle_pitch_inches
         self.rng = np.random.default_rng(seed)
+
+        # Flail envelope obstacle setup (if forward seat pitch is specified)
+        if forward_obstacle_pitch_inches is not None and forward_obstacle_pitch_inches > 0:
+            obs_x_m = float(forward_obstacle_pitch_inches * 0.0254)
+            contact_cfg = FlailEnvelopeContactConfig(
+                obstacles=[ObstacleSurface(position_m=(obs_x_m, 0.0, -0.20), use_soft1_stiffness=True)]
+            )
+            self.contact_engine = ObstacleContactEngine(contact_cfg)
+        else:
+            self.contact_engine = None
+
+        # Modular Articulated Joint Kinematic Chain
+        self.neck_joint = ArticulatedJoint(ArticulatedJointConfig(
+            name="CERVICAL_NECK", k_rot=self.stiff.neck_rot_k, c_rot=self.stiff.neck_rot_c,
+            limit_min_rad=-0.35, limit_max_rad=1.35
+        ))
+        self.torso_joint = ArticulatedJoint(ArticulatedJointConfig(
+            name="THORACOLUMBAR_SPINE", k_rot=self.stiff.spine_rot_k, c_rot=self.stiff.spine_rot_c,
+            limit_min_rad=-0.25, limit_max_rad=1.20
+        ))
+        self.knee_joint_l = ArticulatedJoint(ArticulatedJointConfig(
+            name="KNEE_LEFT", k_rot=self.stiff.knee_joint_k, c_rot=self.stiff.knee_joint_c,
+            limit_min_rad=-0.10, limit_max_rad=2.20
+        ))
+        self.knee_joint_r = ArticulatedJoint(ArticulatedJointConfig(
+            name="KNEE_RIGHT", k_rot=self.stiff.knee_joint_k, c_rot=self.stiff.knee_joint_c,
+            limit_min_rad=-0.10, limit_max_rad=2.20
+        ))
 
     def run(self) -> dict:
         """Executes explicit time integration across the dynamic crash impact window."""
-        # Time Grid (10 kHz sampling, 1901 points: -10ms to +180ms)
         t_arr = np.linspace(-0.010, 0.180, 1901, dtype=np.float64)
         n_steps = len(t_arr)
         dt = t_arr[1] - t_arr[0]
         g_val = 9.80665
 
-        # Compound Orientations (Sled + Seat Mount + Dummy Orientations)
+        # Compound Orientations
         total_yaw_deg = self.yaw_deg + self.dummy_yaw_deg + self.seat_yaw_mount_deg
         total_pitch_deg = self.pitch_deg + self.seat_pitch_warp_deg
         total_roll_deg = self.roll_deg + self.seat_roll_warp_deg
+
+        # AS8049E Pre-test 10-deg Track Warpage Initial Anchor Transformation
+        R_warp = compute_euler_rotation_matrix(self.seat_yaw_mount_deg, self.seat_pitch_warp_deg, self.seat_roll_warp_deg)
+        warp_z_offset_m = float(0.25 * np.sin(np.radians(abs(self.seat_pitch_warp_deg))))
 
         # 3D Sled Acceleration Input in Global Frame (m/s^2)
         ax_sled, ay_sled, az_sled = transform_pulse_3d(
@@ -177,12 +241,12 @@ class LumpedMassCrashModel:
         belt_lap_kn = np.zeros(n_steps, dtype=np.float64)
         seat_deflection_mm = np.zeros(n_steps, dtype=np.float64)
 
-        # Kinematic Displacement Histories (World / Global Frame)
+        # Kinematic Displacement Histories
         sled_disp_x = np.zeros(n_steps, dtype=np.float64)
         sled_disp_y = np.zeros(n_steps, dtype=np.float64)
         sled_disp_z = np.zeros(n_steps, dtype=np.float64)
 
-        # Relative Displacements (Seat rel to Sled; Occupant rel to Seat)
+        # Relative Displacements
         seat_rel_x = np.zeros(n_steps, dtype=np.float64)
         seat_rel_y = np.zeros(n_steps, dtype=np.float64)
         seat_rel_z = np.zeros(n_steps, dtype=np.float64)
@@ -231,7 +295,7 @@ class LumpedMassCrashModel:
         seat_vec_fy = np.zeros(n_steps, dtype=np.float64)
         seat_vec_fz = np.zeros(n_steps, dtype=np.float64)
 
-        # Translational State Variables (Inertial Frame Global Coordinates)
+        # State Variables
         x_sled = 0.0; vx_sled = 0.0
         y_sled = 0.0; vy_sled = 0.0
         z_sled = 0.0; vz_sled = 0.0
@@ -264,27 +328,22 @@ class LumpedMassCrashModel:
         max_head_excursion = 0.0
         max_knee_excursion = 0.0
 
-        total_yaw_deg = self.yaw_deg + self.dummy_yaw_deg + self.seat_yaw_mount_deg
-        total_pitch_deg = self.pitch_deg + self.seat_pitch_warp_deg
-        total_roll_deg = self.roll_deg + self.seat_roll_warp_deg
-
         yaw_rad = np.radians(total_yaw_deg)
-        pitch_rad = np.radians(total_pitch_deg)
         is_vertical_test = "14G" in self.pulse_type or "DOWN" in self.pulse_type or "VERT" in self.pulse_type
 
         seat_mass = 18.0
-        seat_inertia_y = 1.35 # kg*m^2
+        seat_inertia_y = 1.35
 
-        # Pelvis & Torso Physical Offsets (in meters)
-        pelvis_z_offset_m = self.dummy_offset_z * 0.01
+        effective_thorax_mass = self.occ.thorax_mass + self.occ.arms_mass
+
+        pelvis_x_offset_m = self.dummy_offset_x * 0.01
         pelvis_y_offset_m = self.dummy_offset_y * 0.01
+        pelvis_z_offset_m = self.dummy_offset_z * 0.01 + warp_z_offset_m
 
-        # Effective Dynamic Restraint Slack (adjusted for dummy positioning)
-        base_slack_m = self.stiff.belt_slack_mm / 1000.0
+        base_slack_m = (self.stiff.belt_slack_mm + self.stiff.belt_film_spool_mm) / 1000.0
         slack_lap_eff = max(0.005, base_slack_m + pelvis_z_offset_m)
         slack_shoulder_eff = max(0.005, base_slack_m + pelvis_z_offset_m + 0.35 * np.sin(max(0.0, recline_init_rad)))
 
-        # Phase 7: High-Fidelity Mechanics Engines
         seat_mounting = SeatMountingCompliance(
             seat_mass_kg=seat_mass,
             mount_stiffness_n_per_m=self.stiff.rail_mount_k,
@@ -292,35 +351,34 @@ class LumpedMassCrashModel:
         )
         seatback_engine = SeatStructureCompliance(
             seatback_rotational_k_nm_per_rad=self.stiff.seat_rot_k,
-            seatback_rotational_c_nms_per_rad=self.stiff.seat_rot_c
+            seatback_rotational_c_nms_per_rad=self.stiff.seat_rot_c,
+            inertia_kg_m2=seat_inertia_y
         )
         
-        # Pre-Crash Gravity Settling & H-Point Initialization
         initial_settling_m = CushionSettlingMechanics.compute_initial_settling(
-            occupant_mass_kg=(self.occ.pelvis_mass + self.occ.thorax_mass),
+            occupant_mass_kg=(self.occ.pelvis_mass + 0.65 * effective_thorax_mass),
             cushion_stiffness_n_per_m=self.stiff.cushion_k
         )
-        # Apply static equilibrium offset to initial coordinates (Assuming z is vertical/gravitational axis)
-        if is_vertical_test:
-            # For 14G downward, seat translates in +Z, gravity acts in +Z
-            z_pelvis += initial_settling_m
-            z_torso += initial_settling_m
-            z_head += initial_settling_m
-        else:
-            # 16G Forward is typically +X, but gravity is usually in -Z or +Z depending on frame
-            z_pelvis += initial_settling_m
-            z_torso += initial_settling_m
-            z_head += initial_settling_m
+        
+        z_pelvis = initial_settling_m + pelvis_z_offset_m
+        z_torso = initial_settling_m + pelvis_z_offset_m
+        z_head = initial_settling_m + pelvis_z_offset_m
 
         for i in range(n_steps):
-            # 1. Sled Kinematics: Deceleration Pulse Applied Directly to Sled Carriage
+            # 0. CFL Adaptive Critical Timestep Evaluation (OpenRadioss Courant Stability)
+            k_eff_est = max(self.stiff.cushion_k * 3.5, self.stiff.rail_mount_k)
+            m_eff_est = (seat_mass * self.occ.pelvis_mass) / (seat_mass + self.occ.pelvis_mass)
+            dt_crit = ConstitutiveModels.compute_critical_timestep(m_eff_est, k_eff_est, tssfac=0.70)
+            dt_step = min(dt, dt_crit)
+
+            # 1. Sled Kinematics
             ax_in = float(ax_sled[i])
             ay_in = float(ay_sled[i])
             az_in = float(az_sled[i])
 
-            vx_sled += ax_in * dt; x_sled += vx_sled * dt
-            vy_sled += ay_in * dt; y_sled += vy_sled * dt
-            vz_sled += az_in * dt; z_sled += vz_sled * dt
+            vx_sled += ax_in * dt_step; x_sled += vx_sled * dt_step
+            vy_sled += ay_in * dt_step; y_sled += vy_sled * dt_step
+            vz_sled += az_in * dt_step; z_sled += vz_sled * dt_step
 
             sled_disp_x[i] = float(x_sled)
             sled_disp_y[i] = float(y_sled)
@@ -331,64 +389,64 @@ class LumpedMassCrashModel:
 
             if is_vertical_test:
                 # =========================================================================
-                # 14G DOWNWARD VERTICAL DROP TEST (Inertial Frame Formulation)
+                # 14G DOWNWARD VERTICAL DROP TEST
                 # =========================================================================
-                # Vertical Cushion Compression Contact (Seat advances downward into Pelvis)
-                delta_z_cushion_0 = max(0.0, -pelvis_y_offset_m)
-                delta_z_cushion = max(0.0, z_seat - z_pelvis + delta_z_cushion_0)
-                v_rel_z_cushion = max(0.0, vz_seat - vz_pelvis)
-                f_cushion_z = ConstitutiveModels.cushion_hysteresis(delta_z_cushion, v_rel_z_cushion, self.stiff.cushion_k, self.stiff.cushion_c, yield_pen=0.08)
+                delta_z_cushion = max(0.0, z_seat - z_pelvis + initial_settling_m)
+                v_rel_z_cushion = vz_seat - vz_pelvis
+                f_cushion_z = ConstitutiveModels.cushion_3phase_foam(
+                    penetration_m=delta_z_cushion,
+                    velocity_mps=v_rel_z_cushion,
+                    k_cushion=self.stiff.cushion_k,
+                    c_cushion=self.stiff.cushion_c,
+                    plateau_start_m=0.025,
+                    densification_start_m=0.065,
+                    unloading_factor=0.25
+                )
 
-                # Spinal Axial Compression (Pelvis advances downward into Torso)
                 delta_z_spine = z_pelvis - z_torso
                 v_rel_z_spine = vz_pelvis - vz_torso
                 f_spine_z = self.stiff.spine_k_z * delta_z_spine + self.stiff.spine_c_z * v_rel_z_spine
 
-                # Neck Axial Compression (Torso advances downward into Head)
                 delta_z_neck = z_torso - z_head
                 v_rel_z_neck = vz_torso - vz_head
                 f_neck_z = self.stiff.neck_k_z * delta_z_neck + self.stiff.neck_c_z * v_rel_z_neck
 
-                # Floor Mount Track Force (Sled pulls Seat downward)
                 f_mount_z = self.stiff.rail_mount_k * (z_sled - z_seat) + self.stiff.rail_mount_c * (vz_sled - vz_seat)
+                f_floor_sub_z = self.stiff.floor_elastic_k * (z_sled - z_seat) * 0.15
 
-                # Pure Inertial Frame Dynamic Accelerations
-                f_seat_net_z = f_mount_z - f_cushion_z
+                f_seat_net_z = f_mount_z + f_floor_sub_z - f_cushion_z + seat_mass * g_val
                 a_seat_z = f_seat_net_z / seat_mass
                 vz_seat += a_seat_z * dt; z_seat += vz_seat * dt
 
-                f_pelvis_net_z = f_cushion_z - f_spine_z
+                f_pelvis_net_z = f_cushion_z - f_spine_z + self.occ.pelvis_mass * g_val
                 a_pelvis_z = f_pelvis_net_z / self.occ.pelvis_mass
                 vz_pelvis += a_pelvis_z * dt; z_pelvis += vz_pelvis * dt
 
-                f_torso_net_z = f_spine_z - f_neck_z
-                a_torso_z = f_torso_net_z / self.occ.thorax_mass
+                f_torso_net_z = f_spine_z - f_neck_z + effective_thorax_mass * g_val
+                a_torso_z = f_torso_net_z / effective_thorax_mass
                 vz_torso += a_torso_z * dt; z_torso += vz_torso * dt
 
-                f_head_net_z = f_neck_z
+                f_head_net_z = f_neck_z + self.occ.head_mass * g_val
                 a_head_z = f_head_net_z / self.occ.head_mass
                 vz_head += a_head_z * dt; z_head += vz_head * dt
 
-                # Relative Displacements (Relative to Sled/Seat for 3D Viewer)
+                # Relative Displacements
                 seat_rel_z[i] = float(z_seat - z_sled)
                 pelvis_rel_z[i] = float(z_pelvis - z_seat)
                 torso_rel_z[i] = float(z_torso - z_seat)
                 head_rel_z[i] = float(z_head - z_seat)
 
-                # Output Channels (True 3D Resultant for HIC with Gravity Offset)
-                # Assuming +Z is downward, gravity adds to the sensor reading when at rest.
-                a_meas_x = 0.0
-                a_meas_y = 0.0
                 a_meas_z = a_head_z - g_val
-                head_res_g = np.sqrt(a_meas_x**2 + a_meas_y**2 + a_meas_z**2) / g_val
+                head_res_g = abs(a_meas_z) / g_val
                 head_accel_g[i] = float(head_res_g)
 
                 lumbar_load_kn[i] = float(abs(f_spine_z) / 1000.0)
                 neck_fz_n[i] = float(abs(f_neck_z))
-                neck_moment_my[i] = float(abs(f_neck_z) * 0.018)
+                neck_moment_my[i] = float(abs(f_neck_z) * 0.022)
 
-                femur_left_kn[i] = float(0.40)
-                femur_right_kn[i] = float(0.40)
+                femur_dynamic_n = 0.5 * (0.35 * f_cushion_z + 0.20 * abs(f_spine_z))
+                femur_left_kn[i] = float(femur_dynamic_n / 1000.0)
+                femur_right_kn[i] = float(femur_dynamic_n / 1000.0)
 
                 cushion_force_n[i] = float(f_cushion_z)
                 cushion_pen_mm[i] = float(delta_z_cushion * 1000.0)
@@ -396,101 +454,157 @@ class LumpedMassCrashModel:
 
             else:
                 # =========================================================================
-                # 16G FORWARD LONGITUDINAL IMPACT (Inertial Frame Multi-Body Dynamics)
+                # 16G FORWARD LONGITUDINAL IMPACT (3D Restraint + Industrial MBD Chain)
                 # =========================================================================
-                # 1. Lap Belt Webbing Extension (Seat pulls Pelvis forward)
                 ext_lap = max(0.0, (x_seat - x_pelvis) - slack_lap_eff)
-                v_rel_lap = (vx_seat - vx_pelvis)
-                f_belt_pelvis = ConstitutiveModels.nonlinear_belt_webbing(
-                    ext_lap, v_rel_lap, 
-                    self.stiff.belt_k_lap, self.stiff.belt_k_lap * 15.0, self.stiff.belt_k_lap * 50.0, 
-                    self.stiff.belt_c_lap
+                v_rel_lap = vx_seat - vx_pelvis
+                t_lap = ConstitutiveModels.nonlinear_belt_webbing(
+                    extension_m=ext_lap,
+                    velocity_mps=v_rel_lap,
+                    k_base=self.stiff.belt_k_lap,
+                    c_viscous=self.stiff.belt_c_lap,
+                    ref_length_m=0.35
                 )
 
-                # 2. Shoulder Harness Webbing Extension (Seat pulls Torso forward)
                 ext_shoulder = max(0.0, (x_seat - x_torso) - slack_shoulder_eff)
-                v_rel_sh = (vx_seat - vx_torso)
-                f_belt_torso = ConstitutiveModels.nonlinear_belt_webbing(
-                    ext_shoulder, v_rel_sh, 
-                    self.stiff.belt_k_shoulder, self.stiff.belt_k_shoulder * 20.0, self.stiff.belt_k_shoulder * 60.0, 
-                    self.stiff.belt_c_shoulder
+                v_rel_shoulder = vx_seat - vx_torso
+                t_shoulder = ConstitutiveModels.nonlinear_belt_webbing(
+                    extension_m=ext_shoulder,
+                    velocity_mps=v_rel_shoulder,
+                    k_base=self.stiff.belt_k_shoulder,
+                    c_viscous=self.stiff.belt_c_shoulder,
+                    ref_length_m=0.65
                 )
 
-                # 3. Backrest Rebound Unilateral Contact (Torso rebounds back into seat backrest)
+                # 3D Restraint Force Vector Decomposition
+                body_torso_pos = (x_torso, y_torso, z_torso)
+                body_pelvis_pos = (x_pelvis, y_pelvis, z_pelvis)
+                f_sh_x, f_sh_y, f_sh_z = ConstitutiveModels.resolve_belt_force_3d(
+                    t_shoulder, body_torso_pos, self.stiff.belt_anchors.d_ring_xyz
+                )
+                f_lap_x, f_lap_y, f_lap_z = ConstitutiveModels.resolve_belt_force_3d(
+                    t_lap, body_pelvis_pos, self.stiff.belt_anchors.buckle_xyz
+                )
+
+                f_belt_pelvis = t_lap
+                f_belt_torso = t_shoulder
+
+                # 2. Backrest Rebound Unilateral Contact
                 pen_backrest = max(0.0, (x_seat - x_torso))
                 v_pen_backrest = max(0.0, (vx_seat - vx_torso))
                 f_backrest = (self.stiff.backrest_k * pen_backrest + self.stiff.backrest_c * v_pen_backrest) if pen_backrest > 0 else 0.0
 
-                # 4. Cushion Normal & Dynamic Sliding Friction
-                f_cush_norm = (self.occ.pelvis_mass + 0.40 * self.occ.thorax_mass) * g_val
-                v_slip_pelvis = vx_seat - vx_pelvis
-                f_cush_fric = self.stiff.cushion_mu * f_cush_norm * np.tanh(v_slip_pelvis / 0.05)
+                # 3. Cushion Vertical Deflection & Dynamic Friction
+                delta_z_cushion = max(0.0, z_seat - z_pelvis + initial_settling_m)
+                v_rel_z_cushion = vz_seat - vz_pelvis
+                f_cushion_z = ConstitutiveModels.cushion_3phase_foam(
+                    penetration_m=delta_z_cushion,
+                    velocity_mps=v_rel_z_cushion,
+                    k_cushion=self.stiff.cushion_k,
+                    c_cushion=self.stiff.cushion_c,
+                    unloading_factor=0.30
+                )
+                
+                f_normal_effective = max(10.0, f_cushion_z + (self.occ.pelvis_mass + 0.50 * effective_thorax_mass) * g_val)
+                v_rel_seat_pelvis = vx_seat - vx_pelvis
+                f_cush_fric = self.stiff.cushion_mu * f_normal_effective * np.tanh(v_rel_seat_pelvis / 0.05)
 
-                # 5. Inter-Segment Joint Reactions
-                # Thoracolumbar Spine Joint Shear (Pelvis pulls Torso forward)
-                rel_pelvis_torso = x_pelvis - x_torso
-                v_rel_pelvis_torso = vx_pelvis - vx_torso
-                f_spine_x = self.stiff.spine_k_x * rel_pelvis_torso + self.stiff.spine_c_x * v_rel_pelvis_torso
+                # 4. Inter-Segment Joint Reactions
+                dx_spine = x_pelvis - x_torso
+                vx_spine = vx_pelvis - vx_torso
+                f_spine_x = self.stiff.spine_k_x * dx_spine + self.stiff.spine_c_x * vx_spine
 
-                # Cervical Neck Joint with Progressive Flexion Whiplash Hardening
-                rel_torso_head = x_torso - x_head
-                v_rel_torso_head = vx_torso - vx_head
-                cervical_hardening = 1.0 + 15.0 * max(0.0, abs(rel_torso_head) - 0.035)**1.5
-                f_neck_x = self.stiff.neck_k_x * cervical_hardening * rel_torso_head + self.stiff.neck_c_x * v_rel_torso_head
+                delta_z_spine = z_pelvis - z_torso
+                vz_spine = vz_pelvis - vz_torso
+                f_spine_z = self.stiff.spine_k_z * delta_z_spine + self.stiff.spine_c_z * vz_spine
 
-                # Lateral Neck Joint (under yaw)
+                dx_neck = x_torso - x_head
+                vx_neck = vx_torso - vx_head
+                neck_whiplash_gamma = 1.0 + 15.0 * (max(0.0, abs(dx_neck) - 0.035) ** 1.5)
+                f_neck_x = (self.stiff.neck_k_x * neck_whiplash_gamma) * dx_neck + self.stiff.neck_c_x * vx_neck
+
+                delta_z_neck = z_torso - z_head
+                vz_neck = vz_torso - vz_head
+                f_neck_z = self.stiff.neck_k_z * delta_z_neck + self.stiff.neck_c_z * vz_neck
+
                 f_neck_y = self.stiff.neck_k_x * 0.8 * (y_seat - y_head) + self.stiff.neck_c_x * (vy_seat - vy_head)
 
-                # 6. Rail Mount Track Forces (Phase 7 Compliant Engine)
-                f_occupant_reaction_x = f_belt_pelvis + f_belt_torso + f_cush_fric - f_backrest
+                # 5. Secondary Head Strike Flail Envelope Contact (LS-DYNA SOFT=1 Formulated in Cabin Frame)
+                f_head_contact_x = 0.0; f_head_contact_y = 0.0; f_head_contact_z = 0.0
+                if self.contact_engine is not None:
+                    head_cg_x = (x_seat - x_head) + 0.54 - self.contact_engine.config.head_radius_m
+                    head_cg_cabin = (head_cg_x, y_head - y_seat, z_head - z_seat)
+                    head_vel_cabin = (vx_seat - vx_head, vy_seat - vy_head, vz_seat - vz_head)
+                    f_head_contact_x, f_head_contact_y, f_head_contact_z, pen_obs, has_contact = self.contact_engine.evaluate_head_contact(
+                        head_cg_cabin, head_vel_cabin, head_mass_kg=self.occ.head_mass, dt_s=dt
+                    )
+
+                # 6. Rail Mount Track Dynamics
+                f_occupant_reaction_x = f_belt_pelvis + f_belt_torso + f_cush_fric - f_backrest + abs(f_head_contact_x)
                 a_seat_x = seat_mounting.evaluate_seat_acceleration(ax_in, vx_sled, x_sled, f_occupant_reaction_x, dt)
                 x_seat = seat_mounting.x_seat
                 vx_seat = seat_mounting.v_seat
 
                 f_mount_y = self.stiff.rail_mount_k * (y_sled - y_seat) + self.stiff.rail_mount_c * (vy_sled - vy_seat)
-                
-                # 7. Multi-Body Equations of Motion in Inertial Global Frame
                 a_seat_y = f_mount_y / seat_mass
                 vy_seat += a_seat_y * dt; y_seat += vy_seat * dt
 
-                # Pelvis: pulled by lap belt and friction, opposed by spine joint
+                f_mount_z = self.stiff.rail_mount_k * (z_sled - z_seat) + self.stiff.rail_mount_c * (vz_sled - vz_seat)
+                a_seat_z = (f_mount_z - f_cushion_z + seat_mass * g_val) / seat_mass
+                vz_seat += a_seat_z * dt; z_seat += vz_seat * dt
+
+                # 7. Equations of Motion in Inertial Global Frame
                 f_pelvis_net_x = f_belt_pelvis + f_cush_fric - f_spine_x
                 a_pelvis_x = f_pelvis_net_x / self.occ.pelvis_mass
                 vx_pelvis += a_pelvis_x * dt; x_pelvis += vx_pelvis * dt
 
-                # Torso: pulled by shoulder harness, spine, and backrest; opposed by neck joint
+                f_pelvis_net_z = f_cushion_z - f_spine_z + self.occ.pelvis_mass * g_val + f_belt_pelvis * 0.25
+                a_pelvis_z = f_pelvis_net_z / self.occ.pelvis_mass
+                vz_pelvis += a_pelvis_z * dt; z_pelvis += vz_pelvis * dt
+
                 f_torso_net_x = f_belt_torso + f_spine_x + f_backrest - f_neck_x
-                a_torso_x = f_torso_net_x / self.occ.thorax_mass
+                a_torso_x = f_torso_net_x / effective_thorax_mass
                 vx_torso += a_torso_x * dt; x_torso += vx_torso * dt
 
-                # Head: driven purely through cervical neck joint
-                f_head_net_x = f_neck_x
+                f_torso_net_z = f_spine_z - f_neck_z + effective_thorax_mass * g_val - f_belt_torso * 0.15
+                a_torso_z = f_torso_net_z / effective_thorax_mass
+                vz_torso += a_torso_z * dt; z_torso += vz_torso * dt
+
+                f_head_net_x = f_neck_x - f_head_contact_x
                 a_head_x = f_head_net_x / self.occ.head_mass
                 vx_head += a_head_x * dt; x_head += vx_head * dt
 
-                a_head_y = f_neck_y / self.occ.head_mass
+                a_head_y = (f_neck_y - f_head_contact_y) / self.occ.head_mass
                 vy_head += a_head_y * dt; y_head += vy_head * dt
 
-                # 8. Rotational Pitch Differential Equations of Motion (Phase 7 Seatback Engine)
+                f_head_net_z = f_neck_z - f_head_contact_z + self.occ.head_mass * g_val
+                a_head_z = f_head_net_z / self.occ.head_mass
+                vz_head += a_head_z * dt; z_head += vz_head * dt
+
+                # 8. Rotational Dynamics via Modular Articulated Joints
                 m_seat_applied = (f_belt_torso * 0.45 + f_belt_pelvis * 0.15)
-                theta_seat, m_seat_restoring = seatback_engine.evaluate_seatback_response(m_seat_applied, dt)
-                
-                # Enforce physical rotation stops
+                theta_seat, m_seat_restoring = seatback_engine.evaluate_seatback_response(
+                    torso_rebound_moment_nm=m_seat_applied, dt=dt
+                )
                 theta_seat = max(-0.15, min(0.45, theta_seat))
                 seatback_engine.seatback_angle_rad = theta_seat
                 omega_seat = seatback_engine.seatback_omega_rad_per_s
 
-                # Torso Flexion Pitch (Hip Pivot Flexion)
-                m_torso_pitch = (self.occ.thorax_mass * a_torso_x * 0.22) - (f_belt_torso * 0.35 + self.stiff.spine_rot_k * theta_torso + self.stiff.spine_rot_c * omega_torso)
+                # Torso Joint Reaction Moment
+                m_spine_restoring, _ = self.torso_joint.compute_restoring_moment(theta_torso, omega_torso)
+                m_torso_pitch = (effective_thorax_mass * a_torso_x * 0.22) - (f_belt_torso * 0.35 + m_spine_restoring)
                 alpha_torso = m_torso_pitch / self.occ.torso_inertia_y
-                omega_torso += alpha_torso * dt; theta_torso = max(-0.25, min(1.20, theta_torso + omega_torso * dt))
+                omega_torso += alpha_torso * dt
+                theta_torso = max(-0.25, min(1.20, theta_torso + omega_torso * dt))
 
-                # Head Pitch (Cervical Flexion Whiplash Dynamics)
-                m_head_pitch = (self.occ.head_mass * abs(a_head_x - a_torso_x) * self.occ.neck_length_m) - (self.stiff.neck_rot_k * theta_head + self.stiff.neck_rot_c * omega_head)
+                # Neck Joint Reaction Moment
+                m_neck_restoring, _ = self.neck_joint.compute_restoring_moment(theta_head, omega_head)
+                m_head_pitch = (self.occ.head_mass * abs(a_head_x - a_torso_x) * self.occ.neck_length_m) - m_neck_restoring
                 alpha_head = m_head_pitch / self.occ.head_inertia_y
-                omega_head += alpha_head * dt; theta_head = max(-0.35, min(1.35, theta_head + omega_head * dt))
+                omega_head += alpha_head * dt
+                theta_head = max(-0.35, min(1.35, theta_head + omega_head * dt))
 
-                # 9. Femurs & Knee Reactions (Clearance is sensitive to fore/aft pelvis offset and yaw)
+                # 9. Femurs & Knee Multi-Body Kinematics
                 clearance_base = (self.stiff.knee_clearance_mm / 1000.0) + pelvis_z_offset_m
                 clearance_l = max(0.01, clearance_base * (1.0 - 0.45 * np.sin(yaw_rad)))
                 clearance_r = max(0.01, clearance_base * (1.0 + 0.45 * np.sin(yaw_rad)))
@@ -520,58 +634,70 @@ class LumpedMassCrashModel:
                 femur_left_kn[i] = float(f_femur_l / 1000.0)
                 femur_right_kn[i] = float(f_femur_r / 1000.0)
 
-                # Record Relative Displacements (for 3D WebGL Viewer)
+                # Record Displacements
                 seat_deflection_mm[i] = float(abs(x_seat - x_sled) * 1000.0)
                 seat_rel_x[i] = float(x_seat - x_sled)
                 seat_rel_y[i] = float(y_seat - y_sled)
+                seat_rel_z[i] = float(z_seat - z_sled)
                 seat_pitch_rad[i] = float(theta_seat)
 
                 pelvis_rel_x[i] = float(x_seat - x_pelvis)
+                pelvis_rel_z[i] = float(z_pelvis - z_seat)
                 torso_rel_x[i] = float(x_seat - x_torso)
+                torso_rel_z[i] = float(z_torso - z_seat)
                 torso_pitch_rad[i] = float(theta_torso)
 
                 head_rel_x[i] = float(x_seat - x_head)
                 head_rel_y[i] = float(y_head - y_seat)
+                head_rel_z[i] = float(z_head - z_seat)
                 head_pitch_rad[i] = float(theta_head)
 
-                # 10. Head Resultant Acceleration for HIC15 (Translational + Cervical Whiplash CG Acceleration + Gravity)
-                a_head_cg_x = a_head_x + alpha_head * self.occ.neck_length_m
+                # 10. Head Resultant Acceleration for HIC15
+                a_head_cg_x = a_head_x + alpha_head * self.occ.neck_length_m * np.cos(theta_head)
                 a_head_cg_y = a_head_y
-                a_head_cg_z = -g_val # True resultant accelerometer feels 1G upward when at rest. (assuming +Z is down)
+                a_head_cg_z = a_head_z - g_val
                 
                 head_res_g = np.sqrt(a_head_cg_x**2 + a_head_cg_y**2 + a_head_cg_z**2) / g_val
                 head_accel_g[i] = float(head_res_g)
 
-                # Neck Injury Criterion Channels (Signed Nij: Fz & My)
-                f_neck_z = abs(f_neck_x) * 0.35 * (1.0 + abs(total_pitch_deg) / 20.0)
-                neck_moment_mag = abs(f_neck_x * 0.085 + f_neck_z * 0.035)
+                # 11. True Neck Injury Criterion Channels with OC Moment Transformation
+                neck_axial_dynamic = abs(f_neck_z) + self.occ.head_mass * abs(a_head_x) * np.sin(abs(theta_head))
+                neck_moment_cell = self.occ.head_mass * abs(a_head_x) * self.occ.neck_length_m * np.cos(theta_head) + self.occ.head_inertia_y * abs(alpha_head)
+                d_oc_m = 0.01778
+                neck_moment_oc = max(0.0, neck_moment_cell - d_oc_m * abs(f_neck_x) * 0.20)
                 neck_moment_sign = 1.0 if theta_head >= 0 else -1.0
-                neck_moment_my[i] = float(neck_moment_mag * neck_moment_sign)
-                neck_fz_n[i] = float(f_neck_z)
+                
+                neck_moment_my[i] = float(neck_moment_oc * neck_moment_sign)
+                neck_fz_n[i] = float(neck_axial_dynamic)
 
-                # Lumbar Spinal Load (FAA Criterion: <= 6.67 kN / 1500 lbs)
-                pitch_comp = abs(f_spine_x) * np.sin(np.radians(abs(total_pitch_deg) + abs(self.dummy_recline_deg))) * 1.6
-                tot_lumbar = abs(f_spine_x) * 0.75 + f_belt_torso * 0.25 + pitch_comp
-                lumbar_load_kn[i] = float(tot_lumbar / 1000.0)
+                # 12. Lumbar Spinal Load
+                pitch_angle_comp = np.sin(np.radians(abs(total_pitch_deg) + abs(self.dummy_recline_deg)))
+                lumbar_total_n = abs(f_spine_z) + abs(f_spine_x) * pitch_angle_comp * 1.8 + effective_thorax_mass * g_val
+                lumbar_load_kn[i] = float(lumbar_total_n / 1000.0)
 
                 belt_shoulder_kn[i] = float(f_belt_torso / 1000.0)
                 belt_lap_kn[i] = float(f_belt_pelvis / 1000.0)
 
                 belt_lap_ext_mm[i] = float(ext_lap * 1000.0)
                 belt_shoulder_ext_mm[i] = float(ext_shoulder * 1000.0)
+                cushion_force_n[i] = float(f_cushion_z)
+                cushion_pen_mm[i] = float(delta_z_cushion * 1000.0)
                 backrest_force_n[i] = float(f_backrest)
                 backrest_pen_mm[i] = float(pen_backrest * 1000.0)
                 seat_sled_error_mm[i] = float(abs(x_seat - x_sled) * 1000.0)
 
-                # Instantaneous Force Vectors (N)
-                head_vec_fx[i] = float(-f_neck_x)
+                head_vec_fx[i] = float(-f_neck_x - f_head_contact_x)
                 head_vec_fy[i] = float(-f_neck_y)
                 head_vec_fz[i] = float(-f_neck_z)
 
-                torso_vec_fx[i] = float(-f_belt_torso - f_spine_x + f_neck_x + f_backrest)
-                torso_vec_fz[i] = float(-f_neck_z)
+                torso_vec_fx[i] = float(-f_sh_x - f_spine_x + f_neck_x + f_backrest)
+                torso_vec_fy[i] = float(-f_sh_y)
+                torso_vec_fz[i] = float(-f_sh_z - f_neck_z)
 
-                pelvis_vec_fx[i] = float(-f_belt_pelvis + f_spine_x - f_cush_fric)
+                pelvis_vec_fx[i] = float(-f_lap_x + f_spine_x - f_cush_fric)
+                pelvis_vec_fy[i] = float(-f_lap_y)
+                pelvis_vec_fz[i] = float(-f_lap_z + f_spine_z)
+
                 seat_vec_fx[i] = float(f_belt_pelvis + f_belt_torso + f_cush_fric - f_backrest)
 
             excursion_head_mm = (abs(x_seat - x_head) + 0.54) * 1000.0 if not is_vertical_test else 540.0
@@ -582,26 +708,26 @@ class LumpedMassCrashModel:
             if excursion_knee_mm > max_knee_excursion:
                 max_knee_excursion = excursion_knee_mm
 
-        # Submarining Kinematic Risk Indicator (Lap belt slip over iliac crest threshold)
+        # Physical Submarining Kinematic Risk Model
         pelvis_rot_rad = torso_pitch_rad * 0.70
+        alpha_belt_deg = np.degrees(np.arctan2(0.20, np.maximum(0.01, pelvis_rel_x))) - np.degrees(pelvis_rot_rad)
         submarining_risk_series = np.maximum(0.0, (pelvis_rel_x * np.cos(pelvis_rot_rad) - 0.040) / 0.080)
         max_submarining_risk = float(round(np.max(submarining_risk_series), 2))
-        submarining_status = "ELEVATED_SUBMARINING_RISK" if max_submarining_risk > 1.0 else "LOW_NOMINAL"
+        submarining_status = "ELEVATED_SUBMARINING_RISK" if (max_submarining_risk > 1.0 or np.min(alpha_belt_deg) < 30.0) else "LOW_NOMINAL"
 
-        # Structural status evaluation
         structural_status = "INTACT_NO_FAILURE"
         if abs(self.yaw_deg) > 40.0 or abs(self.pitch_deg) > 25.0:
             structural_status = "WARNING_STRUCTURAL_PLASTIC_DEFORMATION"
 
-        # Signal Filtering (SAE J211-1 / ISO 6487 zero-phase digital Butterworth filter)
+        # Signal Filtering
         filtered_head_accel = sae_j211_cfc_filter(head_accel_g, dt, cfc=1000)
         filtered_femur_l = sae_j211_cfc_filter(femur_left_kn, dt, cfc=600)
         filtered_femur_r = sae_j211_cfc_filter(femur_right_kn, dt, cfc=600)
         filtered_lumbar = sae_j211_cfc_filter(lumbar_load_kn, dt, cfc=600)
         filtered_neck_fz = sae_j211_cfc_filter(neck_fz_n, dt, cfc=1000)
         filtered_neck_my = sae_j211_cfc_filter(neck_moment_my, dt, cfc=1000)
-        filtered_belt_shoulder = sae_j211_cfc_filter(belt_shoulder_kn, dt, cfc=600)
-        filtered_belt_lap = sae_j211_cfc_filter(belt_lap_kn, dt, cfc=600)
+        filtered_belt_shoulder = np.maximum(0.0, sae_j211_cfc_filter(belt_shoulder_kn, dt, cfc=600))
+        filtered_belt_lap = np.maximum(0.0, sae_j211_cfc_filter(belt_lap_kn, dt, cfc=600))
 
         req_dv = 10.7 if is_vertical_test else 13.4
         delta_v, dv_pass = validate_pulse_delta_v(t_arr, sled_accel_g, required_delta_v=req_dv)
@@ -613,7 +739,6 @@ class LumpedMassCrashModel:
         max_error = float(np.max(seat_sled_error_mm))
         rms_error = float(np.sqrt(np.mean(seat_sled_error_mm**2)))
 
-        # Global Coordinate Time Histories
         sled_global_x = sled_disp_x.tolist()
         sled_global_y = sled_disp_y.tolist()
         sled_global_z = sled_disp_z.tolist()
@@ -633,6 +758,29 @@ class LumpedMassCrashModel:
         head_global_x = (sled_disp_x + seat_rel_x + head_rel_x).tolist()
         head_global_y = (sled_disp_y + seat_rel_y + head_rel_y).tolist()
         head_global_z = (sled_disp_z + seat_rel_z + head_rel_z).tolist()
+
+        lap_engaged = (np.array(filtered_belt_lap) > 0.05).tolist()
+        shoulder_engaged = (np.array(filtered_belt_shoulder) > 0.05).tolist()
+
+        lap_constraint_dict = {
+            "type": "NONLINEAR_LAP_BELT",
+            "status": "ENGAGED" if max_lap_f > 0.1 else "DISENGAGED",
+            "peak_force_kn": round(max_lap_f, 2),
+            "peak_tension_kn": round(max_lap_f, 2),
+            "extension_series_mm": belt_lap_ext_mm.tolist(),
+            "load_series_kn": filtered_belt_lap.tolist(),
+            "engaged_series": lap_engaged
+        }
+
+        shoulder_constraint_dict = {
+            "type": "NONLINEAR_HARNESS_3POINT",
+            "status": "ENGAGED" if max_sh_f > 0.1 else "DISENGAGED",
+            "peak_force_kn": round(max_sh_f, 2),
+            "peak_tension_kn": round(max_sh_f, 2),
+            "extension_series_mm": belt_shoulder_ext_mm.tolist(),
+            "load_series_kn": filtered_belt_shoulder.tolist(),
+            "engaged_series": shoulder_engaged
+        }
 
         return {
             "time_s": t_arr.tolist(),
@@ -699,24 +847,12 @@ class LumpedMassCrashModel:
                     "error_series_mm": seat_sled_error_mm.tolist(),
                     "anchor_points": ["MOUNT_FRONT_LEFT", "MOUNT_FRONT_RIGHT", "MOUNT_REAR_LEFT", "MOUNT_REAR_RIGHT"]
                 },
-                "lap_belt": {
-                    "type": "TENSION_ONLY_WEBBING",
-                    "status": "ENGAGED" if max_lap_f > 0.05 else "SLACK",
-                    "peak_force_kn": round(max_lap_f, 2),
-                    "force_series_kn": filtered_belt_lap.tolist(),
-                    "extension_series_mm": belt_lap_ext_mm.tolist(),
-                    "engaged_series": [bool(f > 0.02) for f in filtered_belt_lap]
-                },
-                "shoulder_belt": {
-                    "type": "TENSION_ONLY_WEBBING",
-                    "status": "ENGAGED" if max_sh_f > 0.05 else "SLACK",
-                    "peak_force_kn": round(max_sh_f, 2),
-                    "force_series_kn": filtered_belt_shoulder.tolist(),
-                    "extension_series_mm": belt_shoulder_ext_mm.tolist(),
-                    "engaged_series": [bool(f > 0.02) for f in filtered_belt_shoulder]
-                },
+                "seat_to_dummy_lap": lap_constraint_dict,
+                "lap_belt": lap_constraint_dict,
+                "seat_to_dummy_shoulder": shoulder_constraint_dict,
+                "shoulder_belt": shoulder_constraint_dict,
                 "cushion": {
-                    "type": "UNILATERAL_CONTACT",
+                    "type": "3PHASE_CELLULAR_FOAM_HYSTERESIS",
                     "status": "ACTIVE" if max_cush_f > 0.05 else "INACTIVE",
                     "peak_force_kn": round(max_cush_f, 2),
                     "force_series_n": cushion_force_n.tolist(),

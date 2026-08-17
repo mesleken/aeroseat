@@ -1,5 +1,41 @@
 import numpy as np
 
+# NHTSA / FAA 14 CFR § 25.562 Critical Injury Intercepts per Dummy Size
+NIJ_CRITICAL_INTERCEPTS = {
+    "FAA_HIII_50M": {
+        "f_tens": 6811.0,    # N (1531 lbf)
+        "f_comp": 6160.0,    # N (1385 lbf)
+        "m_flex": 310.0,     # N*m (229 ft*lbf)
+        "m_ext": 135.0       # N*m (100 ft*lbf)
+    },
+    "FAA_HIII_5F": {
+        "f_tens": 4287.0,    # N (964 lbf)
+        "f_comp": 3880.0,    # N (872 lbf)
+        "m_flex": 155.0,     # N*m (114 ft*lbf)
+        "m_ext": 67.0        # N*m (49 ft*lbf)
+    },
+    "FAA_HIII_95M": {
+        "f_tens": 8216.0,    # N (1847 lbf)
+        "f_comp": 7430.0,    # N (1670 lbf)
+        "m_flex": 415.0,     # N*m (306 ft*lbf)
+        "m_ext": 179.0       # N*m (132 ft*lbf)
+    }
+}
+
+def apply_oc_moment_correction(
+    my_cell: np.ndarray | list[float],
+    fx_shear: np.ndarray | list[float],
+    d_oc_m: float = 0.01778
+) -> np.ndarray:
+    """
+    Applies SAE J211 / FAA AC 20-146A Occipital Condyle (OC) Moment Transformation.
+    M_y_OC = M_y_cell - d_oc * F_x
+    where d_oc = 0.01778 m (0.70 in) shear moment arm from loadcell center to OC joint.
+    """
+    my = np.asarray(my_cell, dtype=np.float64)
+    fx = np.asarray(fx_shear, dtype=np.float64)
+    return my - d_oc_m * fx
+
 def calculate_hic15_with_window(time_s: np.ndarray | list[float], accel_g: np.ndarray | list[float]) -> tuple[float | None, float | None, float | None]:
     """Calculates HIC15 and returns (max_hic, t1_ms, t2_ms).
     
@@ -17,7 +53,6 @@ def calculate_hic15_with_window(time_s: np.ndarray | list[float], accel_g: np.nd
     if dt <= 0:
         return None, None, None
     
-    # Cumulative trapezoidal integration
     cum_a = np.zeros(n, dtype=np.float64)
     for k in range(1, n):
         cum_a[k] = cum_a[k-1] + 0.5 * (a[k] + a[k-1]) * (t[k] - t[k-1])
@@ -53,18 +88,28 @@ def calculate_hic15(time_s: np.ndarray | list[float], accel_g: np.ndarray | list
     hic, _, _ = calculate_hic15_with_window(time_s, accel_g)
     return hic
 
-def calculate_nij(fz_n: np.ndarray | list[float], my_nm: np.ndarray | list[float]) -> tuple[float | None, str | None]:
-    """Calculates Nij for FAA Hybrid III 50th Male Dummy across 4 neck injury modes per 14 CFR § 25.562."""
+def calculate_nij(
+    fz_n: np.ndarray | list[float],
+    my_nm: np.ndarray | list[float],
+    dummy_type: str = "FAA_HIII_50M",
+    fx_shear_n: np.ndarray | list[float] | None = None
+) -> tuple[float | None, str | None]:
+    """Calculates Nij for FAA Hybrid III Dummies across 4 neck injury modes per 14 CFR § 25.562."""
     fz = np.asarray(fz_n, dtype=np.float64)
     my = np.asarray(my_nm, dtype=np.float64)
     
     if len(fz) == 0 or len(my) == 0:
         return None, None
 
-    f_tension_crit = 6811.0
-    f_compression_crit = 6160.0
-    m_flexion_crit = 310.0
-    m_extension_crit = 135.0
+    # Apply OC moment correction if shear force is provided
+    if fx_shear_n is not None and len(fx_shear_n) == len(my):
+        my = apply_oc_moment_correction(my, fx_shear_n)
+
+    intercepts = NIJ_CRITICAL_INTERCEPTS.get(dummy_type.upper(), NIJ_CRITICAL_INTERCEPTS["FAA_HIII_50M"])
+    f_tension_crit = intercepts["f_tens"]
+    f_compression_crit = intercepts["f_comp"]
+    m_flexion_crit = intercepts["m_flex"]
+    m_extension_crit = intercepts["m_ext"]
 
     nij_tf = np.maximum(0, fz / f_tension_crit) + np.maximum(0, my / m_flexion_crit)
     nij_te = np.maximum(0, fz / f_tension_crit) + np.maximum(0, -my / m_extension_crit)
@@ -94,9 +139,10 @@ def compute_all_injury_metrics(timeseries_data: dict) -> dict:
     lumbar = timeseries_data.get("lumbar_load", [])
     belt_shoulder = timeseries_data.get("belt_shoulder_load_kn", [])
     belt_lap = timeseries_data.get("belt_lap_load_kn", [])
+    dummy_type = timeseries_data.get("dummy_type", "FAA_HIII_50M")
     
     hic15_val, hic_t1, hic_t2 = calculate_hic15_with_window(time_s, head_accel) if len(head_accel) > 0 else (None, None, None)
-    nij_val, nij_type = calculate_nij(neck_fz, neck_my) if (len(neck_my) > 0 and len(neck_fz) > 0) else (None, None)
+    nij_val, nij_type = calculate_nij(neck_fz, neck_my, dummy_type=dummy_type) if (len(neck_my) > 0 and len(neck_fz) > 0) else (None, None)
 
     femur_l_peak = float(round(np.max(np.abs(femur_l)), 2)) if len(femur_l) > 0 else None
     femur_r_peak = float(round(np.max(np.abs(femur_r)), 2)) if len(femur_r) > 0 else None

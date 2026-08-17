@@ -36,42 +36,80 @@ def compute_euler_rotation_matrix(yaw_deg: float = 0.0, pitch_deg: float = 0.0, 
     # Combined rotation matrix: R = Rz * Ry * Rx
     return Rz @ Ry @ Rx
 
-def generate_sae_16g_forward_pulse(t_array: np.ndarray, peak_g: float = 16.0) -> np.ndarray:
-    """Generates standard 16g forward deceleration pulse per 14 CFR § 25.562 / SAE AS8049E.
+def generate_sae_16g_forward_pulse(
+    t_array: np.ndarray,
+    peak_g: float = 16.0,
+    shape: str = "TRIANGLE"
+) -> np.ndarray:
+    """Generates standard 16g forward deceleration pulse per 14 CFR § 25.562 / SAE AS8049E Test 2.
     
-    Standard specifies a triangular pulse with rise time <= 0.090s, total duration ~0.180s.
-    Returns 1D array of acceleration magnitude in g.
+    Standard specifies a pulse with rise time <= 0.090s, total duration ~0.180s,
+    and velocity change Delta V >= 44 ft/s (13.41 m/s).
     """
     pulse = np.zeros_like(t_array, dtype=np.float64)
+    shape_upper = shape.upper()
+    
     for i, t in enumerate(t_array):
         if t < 0.0:
             pulse[i] = 0.0
-        elif t <= 0.090:
-            # Rise phase: 0 -> peak_g
-            pulse[i] = peak_g * (t / 0.090)
         elif t <= 0.180:
-            # Decay phase: peak_g -> 0
-            pulse[i] = peak_g * (1.0 - (t - 0.090) / 0.090)
+            if "SINE" in shape_upper:
+                # Half-sine pulse peaking at 90 ms
+                pulse[i] = peak_g * np.sin(np.pi * t / 0.180)
+            elif "TRAPEZOID" in shape_upper:
+                # Trapezoidal pulse: 40ms rise, 100ms plateau, 40ms decay
+                if t <= 0.040:
+                    pulse[i] = peak_g * (t / 0.040)
+                elif t <= 0.140:
+                    pulse[i] = peak_g
+                else:
+                    pulse[i] = peak_g * (1.0 - (t - 0.140) / 0.040)
+            else:
+                # Standard triangular pulse: 90ms rise, 90ms decay
+                if t <= 0.090:
+                    pulse[i] = peak_g * (t / 0.090)
+                else:
+                    pulse[i] = peak_g * (1.0 - (t - 0.090) / 0.090)
         else:
             pulse[i] = 0.0
+            
     return pulse
 
-def generate_sae_14g_downward_pulse(t_array: np.ndarray, peak_g: float = 14.0) -> np.ndarray:
-    """Generates standard 14g downward deceleration pulse per 14 CFR § 25.562 / SAE AS8049E.
+def generate_sae_14g_downward_pulse(
+    t_array: np.ndarray,
+    peak_g: float = 14.0,
+    shape: str = "TRIANGLE"
+) -> np.ndarray:
+    """Generates standard 14g downward deceleration pulse per 14 CFR § 25.562 / SAE AS8049E Test 1.
     
-    Standard specifies a triangular pulse peaking at 14g with rise time <= 0.080s, duration ~0.160s.
-    Returns 1D array of acceleration magnitude in g.
+    Standard specifies a pulse peaking at 14g with rise time <= 0.080s, duration ~0.160s,
+    and velocity change Delta V >= 35 ft/s (10.67 m/s).
     """
     pulse = np.zeros_like(t_array, dtype=np.float64)
+    shape_upper = shape.upper()
+    
     for i, t in enumerate(t_array):
         if t < 0.0:
             pulse[i] = 0.0
-        elif t <= 0.080:
-            pulse[i] = peak_g * (t / 0.080)
         elif t <= 0.160:
-            pulse[i] = peak_g * (1.0 - (t - 0.080) / 0.080)
+            if "SINE" in shape_upper:
+                # Half-sine pulse peaking at 80 ms
+                pulse[i] = peak_g * np.sin(np.pi * t / 0.160)
+            elif "TRAPEZOID" in shape_upper:
+                if t <= 0.035:
+                    pulse[i] = peak_g * (t / 0.035)
+                elif t <= 0.125:
+                    pulse[i] = peak_g
+                else:
+                    pulse[i] = peak_g * (1.0 - (t - 0.125) / 0.035)
+            else:
+                if t <= 0.080:
+                    pulse[i] = peak_g * (t / 0.080)
+                else:
+                    pulse[i] = peak_g * (1.0 - (t - 0.080) / 0.080)
         else:
             pulse[i] = 0.0
+            
     return pulse
 
 def interpolate_custom_pulse(
@@ -106,23 +144,27 @@ def transform_pulse_3d(
     Returns (ax_m_s2, ay_m_s2, az_m_s2).
     """
     g_to_ms2 = 9.80665
+    pulse_upper = pulse_type.upper()
     
-    if custom_pulse_data and "time_s" in custom_pulse_data and "acceleration_g" in custom_pulse_data:
+    if custom_pulse_data and "time_s" in custom_pulse_data and ("acceleration_g" in custom_pulse_data or "ax_g" in custom_pulse_data):
+        accel_key = "acceleration_g" if "acceleration_g" in custom_pulse_data else "ax_g"
         mag_g = interpolate_custom_pulse(
             t_array,
             custom_pulse_data["time_s"],
-            custom_pulse_data["acceleration_g"]
+            custom_pulse_data[accel_key]
         )
-        if "14G" in pulse_type.upper() or "DOWN" in pulse_type.upper() or "VERT" in pulse_type.upper():
+        if "14G" in pulse_upper or "DOWN" in pulse_upper or "VERT" in pulse_upper:
             base_vector = np.array([0.0, 0.0, 1.0], dtype=np.float64)
         else:
             base_vector = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    elif "14G" in pulse_type.upper() or "DOWN" in pulse_type.upper() or "VERT" in pulse_type.upper():
-        mag_g = generate_sae_14g_downward_pulse(t_array, peak_g=14.0)
+    elif "14G" in pulse_upper or "DOWN" in pulse_upper or "VERT" in pulse_upper:
+        shape = "SINE" if "SINE" in pulse_upper else "TRIANGLE"
+        mag_g = generate_sae_14g_downward_pulse(t_array, peak_g=14.0, shape=shape)
         # 14g base vector is purely in +Z direction (downward compression)
         base_vector = np.array([0.0, 0.0, 1.0], dtype=np.float64)
     else:
-        mag_g = generate_sae_16g_forward_pulse(t_array, peak_g=16.0)
+        shape = "SINE" if "SINE" in pulse_upper else "TRIANGLE"
+        mag_g = generate_sae_16g_forward_pulse(t_array, peak_g=16.0, shape=shape)
         # 16g base vector is in +X direction (forward deceleration)
         base_vector = np.array([1.0, 0.0, 0.0], dtype=np.float64)
 

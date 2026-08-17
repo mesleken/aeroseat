@@ -37,8 +37,9 @@ class CustomSimRequest(BaseModel):
     cushion_k: float = 36000.0
 
 @router.post("/auto-calibrate")
+@router.post("/simulations/auto-calibrate")
 def run_auto_calibration(payload: CalibrationRequest):
-    """Runs the SciPy Nelder-Mead optimization on the Phase 7 Simulation Engine."""
+    """Runs the SciPy Nelder-Mead optimization on the Simulation Engine."""
     from app.domain.physics.calibration_engine import ModelCalibrationEngine
     from app.domain.physics.lumped_mass_model import LumpedMassCrashModel
     import numpy as np
@@ -73,9 +74,11 @@ def run_auto_calibration(payload: CalibrationRequest):
     }
 
 @router.post("/simulate-custom")
+@router.post("/simulations/simulate-custom")
 def run_custom_simulation(payload: CustomSimRequest):
     """Runs a 16G/14G simulation using manual custom stiffness parameters."""
     from app.domain.physics.lumped_mass_model import LumpedMassCrashModel
+    from app.domain.injury_metrics import compute_all_injury_metrics
     
     model = LumpedMassCrashModel(dummy_type=payload.dummy_type, pulse_type=payload.pulse_type)
     model.stiff.belt_k_lap = payload.belt_k_lap
@@ -85,16 +88,11 @@ def run_custom_simulation(payload: CustomSimRequest):
     model.stiff.cushion_k = payload.cushion_k
     
     results = model.run()
+    metrics = compute_all_injury_metrics(results)
     
-    # Prune full timeseries arrays to limit payload size if necessary, but frontend uses it for 3D
     return {
         "status": "success",
-        "metrics": {
-            "hic15": results.get("hic15"),
-            "nij_max": results.get("nij_max"),
-            "lumbar_load": results.get("lumbar_load"),
-            "belt_shoulder_load_kn": results.get("belt_shoulder_load_kn")
-        },
+        "metrics": metrics,
         "timeseries": results
     }
 @router.post("/simulation-configurations", status_code=status.HTTP_201_CREATED)
